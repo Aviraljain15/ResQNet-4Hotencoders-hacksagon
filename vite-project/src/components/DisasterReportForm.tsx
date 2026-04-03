@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react"
-import { MapPin, Upload, X, AlertTriangle, Video, ImageIcon, Crosshair, CheckCircle2, Clock, XCircle } from "lucide-react"
+import { MapPin, X, AlertTriangle, Video, ImageIcon, Crosshair, CheckCircle2, Clock, XCircle } from "lucide-react"
 import { Button } from "./ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card"
 import { Input } from "./ui/input"
@@ -13,10 +13,8 @@ import {
 } from "./ui/select"
 import { Field, FieldLabel, FieldError, FieldGroup } from "./ui/field"
 import { cn } from "../lib/utils"
-import { auth, db, storage } from "../lib/firebase"
-import { ref, uploadBytes, getDownloadURL } from "firebase/storage"
+import { auth, db } from "../lib/firebase"
 import { collection, addDoc, doc, updateDoc, serverTimestamp } from "firebase/firestore"
-import { indianDistricts } from "../lib/districts"
 import { analyzeReport } from "../lib/aiService"
 
 // Import Leaflet CSS
@@ -48,6 +46,10 @@ interface Report {
   location: MarkerPosition | null
   status: ReportStatus
   createdAt: Date
+  imageUrls?: string[]
+  imageUrl?: string
+  videoUrl?: string | null
+  district?: string
 }
 
 const incidentTypes = [
@@ -135,6 +137,61 @@ function StatusBadge({ status }: { status: ReportStatus }) {
   )
 }
 
+async function getDistrictFromCoords(lat: number, lng: number): Promise<string> {
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`)
+    if (!res.ok) return "Unknown District"
+
+    const data = await res.json()
+    const address = data.address || {}
+
+    // Priority order for India: city_district > county > state_district > city
+    const candidates = [
+      address.city_district,
+      address.county,
+      address.state_district,
+      address.city
+    ]
+
+    let selectedDistrict = ""
+
+    for (const candidate of candidates) {
+      if (candidate) {
+        const lower = candidate.toLowerCase()
+        if (
+          !lower.includes("tehsil") &&
+          !lower.includes("tahsil") &&
+          !lower.includes("taluk") &&
+          !lower.includes("block") &&
+          !lower.includes("mandal")
+        ) {
+          selectedDistrict = candidate
+          break
+        }
+      }
+    }
+
+    if (!selectedDistrict) return "Unknown District"
+
+    // Normalization: clean trailing district words, handle spaces, capitalize
+    let clean = selectedDistrict
+      .replace(/district/gi, "")
+      .replace(/tahsil/gi, "")
+      .replace(/tehsil/gi, "")
+      .trim()
+    if (clean.length > 0) {
+      clean = clean.charAt(0).toUpperCase() + clean.slice(1)
+    } else {
+      return "Unknown District"
+    }
+
+    return clean
+  } catch (error) {
+    console.error("Reverse geocoding error:", error)
+    return "Unknown District"
+  }
+}
+
 function DisasterReportForm() {
   const [incidentType, setIncidentType] = useState<string>("")
   const [severity, setSeverity] = useState<Severity>("medium")
@@ -148,6 +205,7 @@ function DisasterReportForm() {
   const [phone, setPhone] = useState("")
   const [errors, setErrors] = useState<FormErrors>({})
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [loadingMessage, setLoadingMessage] = useState("")
   const [isDetectingLocation, setIsDetectingLocation] = useState(false)
   const [mapLoaded, setMapLoaded] = useState(false)
 
@@ -156,15 +214,59 @@ function DisasterReportForm() {
   const [latestSubmittedReport, setLatestSubmittedReport] = useState<Report | null>(null)
   const [showStatusPanel, setShowStatusPanel] = useState(false)
 
-  // District state for Firestore
-  const [district, setDistrict] = useState<string>("")
   const [submitError, setSubmitError] = useState<string | null>(null)
 
   const imageInputRef = useRef<HTMLInputElement>(null)
-  const videoInputRef = useRef<HTMLInputElement>(null)
   const mapRef = useRef<HTMLDivElement>(null)
   const leafletMapRef = useRef<L.Map | null>(null)
   const markerRef = useRef<L.Marker | null>(null)
+
+  // Upload images to Cloudinary (NOT Firebase Storage)
+  const uploadMultipleImages = async (files: File[]): Promise<string[]> => {
+    const uploadPromises = files.map(async (file) => {
+      const formData = new FormData()
+      formData.append("file", file)
+      formData.append("upload_preset", "disaster_upload")
+
+      const res = await fetch(
+        "https://api.cloudinary.com/v1_1/dwgdzlhtp/image/upload",
+        { method: "POST", body: formData }
+      )
+
+      if (!res.ok) {
+        throw new Error("Cloudinary upload failed")
+      }
+
+      const data = await res.json()
+      return data.secure_url
+    })
+
+    return await Promise.all(uploadPromises)
+  }
+
+  const uploadVideo = async (file: File): Promise<string> => {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 60000) // 1 min timeout
+    try {
+      const formData = new FormData()
+      formData.append("file", file)
+      formData.append("upload_preset", "disaster_upload")
+
+      const res = await fetch(
+        "https://api.cloudinary.com/v1_1/dwgdzlhtp/video/upload",
+        { method: "POST", body: formData, signal: controller.signal }
+      )
+
+      if (!res.ok) {
+        throw new Error("Cloudinary video upload failed")
+      }
+
+      const data = await res.json()
+      return data.secure_url
+    } finally {
+      clearTimeout(timeoutId)
+    }
+  }
 
   // Process AI analysis for the report
   async function processAI(reportId: string, imageFile: File, desc: string) {
@@ -262,13 +364,32 @@ function DisasterReportForm() {
     return () => clearTimeout(timer)
   }, [latestSubmittedReport])
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleMediaUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
-    if (files.length > 0) {
-      setImages((prev) => [...prev, ...files])
-      const newPreviews = files.map((file) => URL.createObjectURL(file))
+    
+    // File Separation Logic
+    const imageFiles = files.filter(file => file.type.startsWith("image/"))
+    const videoFiles = files.filter(file => file.type.startsWith("video/"))
+    
+    if (imageFiles.length + videoFiles.length !== files.length) {
+      setErrors((prev) => ({ ...prev, images: "Only image and video files are allowed" }))
+    }
+
+    if (images.length + imageFiles.length > 5) {
+      setErrors((prev) => ({ ...prev, images: "You can upload a maximum of 5 images" }))
+    } else if (imageFiles.length > 0) {
+      setImages((prev) => [...prev, ...imageFiles])
+      const newPreviews = imageFiles.map((file) => URL.createObjectURL(file))
       setImagePreviews((prev) => [...prev, ...newPreviews])
       setErrors((prev) => ({ ...prev, images: undefined }))
+    }
+
+    if (videoFiles.length > 0 && !video) {
+      if (videoFiles[0].size > 50 * 1024 * 1024) {
+        alert("Video must be under 50MB")
+      } else {
+        setVideo(videoFiles[0])
+      }
     }
   }
 
@@ -278,17 +399,10 @@ function DisasterReportForm() {
     setImagePreviews((prev) => prev.filter((_, i) => i !== index))
   }
 
-  const handleVideoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (file) {
-      setVideo(file)
-    }
-  }
-
   const removeVideo = () => {
     setVideo(null)
-    if (videoInputRef.current) {
-      videoInputRef.current.value = ""
+    if (imageInputRef.current) {
+      imageInputRef.current.value = ""
     }
   }
 
@@ -345,6 +459,8 @@ function DisasterReportForm() {
     }
     if (images.length === 0) {
       newErrors.images = "Please upload at least one image"
+    } else if (images.length > 5) {
+      newErrors.images = "You can upload a maximum of 5 images"
     }
     if (!name.trim()) {
       newErrors.name = "Please enter your name"
@@ -362,6 +478,27 @@ function DisasterReportForm() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
 
+    // 1. Strict Validations (Alerts)
+    if (!/^[a-zA-Z\s]{3,}$/.test(name.trim())) {
+      alert("Please enter a valid Name (minimum 3 letters, no numbers/symbols)")
+      return
+    }
+
+    if (!/^[0-9]{10}$/.test(phone.trim())) {
+      alert("Enter a valid 10-digit phone number")
+      return
+    }
+
+    const charCount = description.trim().length
+    if (charCount < 50) {
+      alert("Description must be at least 50 characters long")
+      return
+    }
+    if (charCount > 300) {
+      alert("Description cannot exceed 300 characters")
+      return
+    }
+
     if (!validate()) {
       return
     }
@@ -370,25 +507,47 @@ function DisasterReportForm() {
     setSubmitError(null)
 
     try {
-      let imageUrl = ""
+      let uploadedUrls: string[] = []
+      let uploadedVideoUrl: string | null = null
+      let detectedDistrict = "Unknown District"
 
-      // 1. Upload first image to Firebase Storage
-      if (images.length > 0) {
-        const imageFile = images[0]
-        const storageRef = ref(storage, `reports/${Date.now()}_${imageFile.name}`)
-        const snapshot = await uploadBytes(storageRef, imageFile)
-        imageUrl = await getDownloadURL(snapshot.ref)
+      // 2. Get location lat/lng & 3. Reverse geocode -> district (with filtering logic)
+      if (locationSelected) {
+        setLoadingMessage("Detecting district...")
+        detectedDistrict = await getDistrictFromCoords(markerPosition.lat, markerPosition.lng)
+        console.log("Detected district:", detectedDistrict)
       }
 
-      // 2. Save report to Firestore
+      // 3. Upload images
+      if (images.length > 0) {
+        setLoadingMessage(`Uploading media...`)
+        uploadedUrls = await uploadMultipleImages(images)
+        console.log("ALL URLS:", uploadedUrls)
+      }
+
+      // 4. Upload video
+      if (video) {
+        setLoadingMessage(`Uploading media...`)
+        try {
+          uploadedVideoUrl = await uploadVideo(video)
+        } catch (error) {
+          alert("Video upload failed. Proceeding without video.")
+          console.error(error)
+        }
+      }
+
+      setLoadingMessage("Saving report...")
+
+      // 5. Save report to Firestore
       const reportData = {
         userId: auth.currentUser?.uid || null,
         description: description,
-        imageUrl: imageUrl,
-        district: district || "Unknown",
+        imageUrls: uploadedUrls,
+        videoUrl: uploadedVideoUrl,
+        location: locationSelected ? { lat: markerPosition.lat, lng: markerPosition.lng } : null,
+        district: detectedDistrict,
         incidentType: incidentType,
         severity: severity,
-        location: locationSelected ? { lat: markerPosition.lat, lng: markerPosition.lng } : null,
         status: "pending",
         aiStatus: "processing",
         createdAt: serverTimestamp(),
@@ -396,7 +555,7 @@ function DisasterReportForm() {
 
       const docRef = await addDoc(collection(db, "reports"), reportData)
 
-      // 3. Call AI processing
+      // 6. Call AI processing
       if (images.length > 0) {
         processAI(docRef.id, images[0], description)
       }
@@ -409,6 +568,9 @@ function DisasterReportForm() {
         location: locationSelected ? markerPosition : null,
         status: "pending",
         createdAt: new Date(),
+        imageUrls: uploadedUrls,
+        videoUrl: uploadedVideoUrl,
+        district: detectedDistrict,
       }
 
       // Add to reports list (latest first)
@@ -427,8 +589,8 @@ function DisasterReportForm() {
       setVideo(null)
       setName("")
       setPhone("")
-      setDistrict("")
       setErrors({})
+      setLoadingMessage("")
 
       // Reset map position
       if (leafletMapRef.current && markerRef.current) {
@@ -533,27 +695,6 @@ function DisasterReportForm() {
                 </div>
               </Field>
 
-              {/* District Select */}
-              <Field>
-                <FieldLabel>
-                  District <span className="text-red-500">*</span>
-                </FieldLabel>
-                <Select value={district} onValueChange={(value) => {
-                  setDistrict(value)
-                }}>
-                  <SelectTrigger className="w-full transition-all duration-200">
-                    <SelectValue placeholder="Select your district" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {indianDistricts.map((d) => (
-                      <SelectItem key={d} value={d}>
-                        {d}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-
               {/* Interactive Map Section */}
               <Field data-invalid={!!errors.location}>
                 <FieldLabel>
@@ -648,10 +789,10 @@ function DisasterReportForm() {
                 {errors.description && <FieldError>{errors.description}</FieldError>}
               </Field>
 
-              {/* Image Upload */}
+              {/* Media Upload */}
               <Field data-invalid={!!errors.images}>
                 <FieldLabel>
-                  Upload Images <span className="text-red-500">*</span>
+                  Upload Media <span className="text-red-500">*</span>
                 </FieldLabel>
                 <div
                   onClick={() => imageInputRef.current?.click()}
@@ -663,14 +804,14 @@ function DisasterReportForm() {
                   <div className="flex size-10 items-center justify-center rounded-full bg-muted">
                     <ImageIcon className="size-5 text-muted-foreground" />
                   </div>
-                  <p className="mt-2 text-sm font-medium">Click to upload images</p>
-                  <p className="text-xs text-muted-foreground">PNG, JPG up to 10MB each</p>
+                  <p className="mt-2 text-sm font-medium">Click to upload media</p>
+                  <p className="text-xs text-muted-foreground">Max 5 images. Optional 1 video.</p>
                   <input
                     ref={imageInputRef}
                     type="file"
-                    accept="image/*"
+                    accept="image/*,video/*"
                     multiple
-                    onChange={handleImageUpload}
+                    onChange={handleMediaUpload}
                     className="hidden"
                   />
                 </div>
@@ -708,16 +849,10 @@ function DisasterReportForm() {
                     ))}
                   </div>
                 )}
-                {errors.images && <FieldError>{errors.images}</FieldError>}
-              </Field>
 
-              {/* Video Upload (Optional) */}
-              <Field>
-                <FieldLabel>
-                  Upload Video <span className="text-muted-foreground">(optional)</span>
-                </FieldLabel>
-                {video ? (
-                  <div className="flex items-center justify-between rounded-lg border bg-muted/30 p-3 shadow-sm transition-all duration-200 hover:shadow-md">
+                {/* Video Preview */}
+                {video && (
+                  <div className="mt-3 flex items-center justify-between rounded-lg border bg-muted/30 p-3 shadow-sm transition-all duration-200 hover:shadow-md">
                     <div className="flex items-center gap-3">
                       <div className="flex size-10 items-center justify-center rounded-lg bg-blue-100">
                         <Video className="size-5 text-blue-600" />
@@ -733,28 +868,17 @@ function DisasterReportForm() {
                       type="button"
                       variant="ghost"
                       size="icon-sm"
-                      onClick={removeVideo}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        removeVideo()
+                      }}
                       className="transition-colors hover:bg-red-100 hover:text-red-600"
                     >
                       <X className="size-4" />
                     </Button>
                   </div>
-                ) : (
-                  <div
-                    onClick={() => videoInputRef.current?.click()}
-                    className="flex cursor-pointer items-center justify-center gap-3 rounded-lg border-2 border-dashed border-muted-foreground/25 p-4 transition-all duration-200 hover:bg-muted/50 hover:shadow-sm"
-                  >
-                    <Upload className="size-5 text-muted-foreground" />
-                    <span className="text-sm text-muted-foreground">Click to upload video</span>
-                    <input
-                      ref={videoInputRef}
-                      type="file"
-                      accept="video/*"
-                      onChange={handleVideoUpload}
-                      className="hidden"
-                    />
-                  </div>
                 )}
+                {errors.images && <FieldError>{errors.images}</FieldError>}
               </Field>
 
               {/* Contact Details */}
@@ -816,7 +940,7 @@ function DisasterReportForm() {
                 {isSubmitting ? (
                   <>
                     <span className="mr-2 size-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                    Submitting Report...
+                    {loadingMessage || "Submitting Report..."}
                   </>
                 ) : (
                   "Submit Report"
@@ -864,7 +988,7 @@ function DisasterReportForm() {
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-muted-foreground">Location</span>
                   <span className="text-sm font-medium">
-                    {latestSubmittedReport.location.lat.toFixed(4)}, {latestSubmittedReport.location.lng.toFixed(4)}
+                    {latestSubmittedReport.district || "Unknown"} ({latestSubmittedReport.location.lat.toFixed(4)}, {latestSubmittedReport.location.lng.toFixed(4)})
                   </span>
                 </div>
               )}
@@ -897,19 +1021,49 @@ function DisasterReportForm() {
                 <div
                   key={report.id}
                   className={cn(
-                    "flex items-center justify-between rounded-lg border bg-background p-4 transition-all duration-200 hover:shadow-sm",
+                    "flex border bg-background p-4 rounded-lg flex-col gap-3 transition-all duration-200 hover:shadow-sm",
                     latestSubmittedReport?.id === report.id && "ring-2 ring-blue-200"
                   )}
                 >
-                  <div className="flex flex-col gap-1">
-                    <span className="font-medium">
-                      {incidentTypeLabels[report.incidentType] || report.incidentType}
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      {formatDate(report.createdAt)}
-                    </span>
+                  <div className="flex items-center justify-between">
+                    <div className="flex flex-col gap-1">
+                      <span className="font-medium">
+                        {incidentTypeLabels[report.incidentType] || report.incidentType}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {formatDate(report.createdAt)}
+                      </span>
+                    </div>
+                    <StatusBadge status={report.status} />
                   </div>
-                  <StatusBadge status={report.status} />
+                  
+                  {/* Image thumbnails for backward compatibility and multi-image */}
+                  {(report.imageUrls?.length || report.imageUrl) ? (
+                    <div className="flex gap-2 overflow-x-auto pb-1 mt-2">
+                      {report.imageUrls ? (
+                        report.imageUrls.map((url, idx) => (
+                          <img 
+                            key={idx} 
+                            src={url} 
+                            alt={`Report image ${idx + 1}`} 
+                            className="h-16 w-16 min-w-16 rounded-md object-cover border" 
+                          />
+                        ))
+                      ) : report.imageUrl ? (
+                        <img 
+                          src={report.imageUrl} 
+                          alt="Report image" 
+                          className="h-16 w-16 min-w-16 rounded-md object-cover border" 
+                        />
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {report.videoUrl && (
+                    <div className="mt-2 flex">
+                      <video src={report.videoUrl} controls className="h-32 w-auto rounded-md border bg-black object-contain" />
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
