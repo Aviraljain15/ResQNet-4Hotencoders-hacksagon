@@ -122,11 +122,11 @@ export function BottomPanels() {
           </div>
         </div>
         
-        <div className="px-2 sm:px-3 py-1.5 sm:py-2 flex gap-1.5 sm:gap-2 border-b border-[#2A2A2A] shrink-0 overflow-x-auto">
+        {/* <div className="px-2 sm:px-3 py-1.5 sm:py-2 flex gap-1.5 sm:gap-2 border-b border-[#2A2A2A] shrink-0 overflow-x-auto">
           <button className="bg-[#FF9500]/20 text-[#FF9500] px-2 sm:px-3 py-0.5 sm:py-1 rounded-full text-[9px] sm:text-[10px] font-bold whitespace-nowrap">All</button>
           <button className="text-gray-500 px-2 sm:px-3 py-0.5 sm:py-1 text-[9px] sm:text-[10px] font-bold whitespace-nowrap">Critical</button>
           <button className="text-gray-500 px-2 sm:px-3 py-0.5 sm:py-1 text-[9px] sm:text-[10px] font-bold whitespace-nowrap">Verified</button>
-        </div>
+        </div> */}
 
         <div className="flex-1 overflow-y-auto p-2 sm:p-3 space-y-2 sm:space-y-3">
           {resourceReports.map((report, idx) => (
@@ -172,9 +172,9 @@ export function BottomPanels() {
                     <button className="flex-1 bg-[#FF3B30]/20 text-[#FF3B30] border border-[#FF3B30]/30 py-1 sm:py-1.5 rounded text-[8px] sm:text-[10px] font-bold flex items-center justify-center">
                       <X className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" /> <span className="hidden sm:inline">REJECT</span><span className="sm:hidden">NO</span>
                     </button>
-                    <button className="flex-1 bg-yellow-500/20 text-yellow-500 border border-yellow-500/30 py-1 sm:py-1.5 rounded text-[8px] sm:text-[10px] font-bold flex items-center justify-center">
+                    {/* <button className="flex-1 bg-yellow-500/20 text-yellow-500 border border-yellow-500/30 py-1 sm:py-1.5 rounded text-[8px] sm:text-[10px] font-bold flex items-center justify-center">
                       <Users className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" /> <span className="hidden sm:inline">ASSIGN</span><span className="sm:hidden">ADD</span>
-                    </button>
+                    </button> */}
                   </div>
                 </>
               )}
